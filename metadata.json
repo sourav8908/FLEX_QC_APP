@@ -1,0 +1,7 @@
+{
+  "name": "Flex QC Prototype",
+  "description": "An internal quality control application for factory floor inspections, featuring stage selection, device tracking, and mandatory checkpoint verification.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
