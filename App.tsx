@@ -1,6 +1,7 @@
-import React, { useState, useEffect } from 'react';
-import { AppStep, Stage, User, QCReport, CheckpointResult } from './types';
-import { getStoredUsers, saveUsers, saveReport, getStoredReports } from './storage';
+import React, { useState, useEffect, useRef } from 'react';
+import jsQR from 'jsqr';
+import { AppStep, Stage, User, QCReport, CheckpointResult, DeviceStatus } from './types';
+import { getStoredUsers, saveUsers, saveReport, getStoredReports, getDeviceStatus, updateDeviceStatus, getDeviceStatuses } from './storage';
 import { FQC_CHECKPOINTS, PACKAGING_CHECKPOINTS } from './constants.tsx';
 import { 
   CameraIcon, 
@@ -84,6 +85,101 @@ const App: React.FC = () => {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState('');
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [scanning, setScanning] = useState(false);
+  
+  const startScanning = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        setScanning(true);
+      }
+    } catch (err) {
+      console.error('Error accessing camera:', err);
+      setError('Camera access denied. Please enable camera permissions to scan QR codes/barcodes.');
+    }
+  };
+  
+  const stopScanning = () => {
+    if (videoRef.current && videoRef.current.srcObject) {
+      const tracks = (videoRef.current.srcObject as MediaStream).getTracks();
+      tracks.forEach(track => track.stop());
+      videoRef.current.srcObject = null;
+      setScanning(false);
+    }
+  };
+  
+  // Function to detect QR codes/barcodes from video stream
+  const detectCode = () => {
+    if (!videoRef.current || !scanning) return;
+      
+    try {
+      const video = videoRef.current;
+        
+      // Only process if video is ready and playing
+      if (video.readyState === video.HAVE_ENOUGH_DATA) {
+        // Create canvas to capture video frame for analysis
+        const canvas = document.createElement('canvas');
+        const canvasContext = canvas.getContext('2d');
+          
+        if (!canvasContext) {
+          console.error('Could not get canvas context');
+          requestAnimationFrame(detectCode);
+          return;
+        }
+          
+        // Set canvas dimensions (using smaller size for better performance)
+        const width = video.videoWidth;
+        const height = video.videoHeight;
+        canvas.width = width;
+        canvas.height = height;
+          
+        // Draw current video frame to canvas
+        canvasContext.drawImage(video, 0, 0, width, height);
+          
+        // Get image data from canvas
+        const imageData = canvasContext.getImageData(0, 0, width, height);
+          
+        // Use jsQR to scan for QR codes
+        const code = jsQR(imageData.data, width, height);
+          
+        if (code) {
+          // QR/Barcode detected!
+          setDeviceId(code.data);
+          // Auto-proceed to checklist after scan
+          const baseCheckpoints = selectedStage === 'FQC' ? FQC_CHECKPOINTS : PACKAGING_CHECKPOINTS;
+          setCheckpoints(baseCheckpoints.map(cp => ({ ...cp, status: null, image: null, reason: '' })));
+          setCurrentStep(AppStep.CHECKLIST);
+          stopScanning();
+          return;
+        }
+      }
+        
+      // If no code detected, continue scanning
+      requestAnimationFrame(detectCode);
+    } catch (err) {
+      console.error('Error detecting code:', err);
+      // If error occurs, continue scanning
+      requestAnimationFrame(detectCode);
+    }
+  };
+  
+  // Effect to continuously scan when camera is active
+  useEffect(() => {
+    if (scanning) {
+      detectCode();
+      
+      // Poll for detection
+      const interval = setInterval(() => {
+        if (scanning) {
+          detectCode();
+        }
+      }, 1000);
+      
+      return () => clearInterval(interval);
+    }
+  }, [scanning]);
 
   const handleStageSelect = (stage: Stage) => {
     setSelectedStage(stage);
@@ -151,6 +247,17 @@ const App: React.FC = () => {
       setError('Device ID is required');
       return;
     }
+    
+    // Stage control logic - check if device has completed required previous stage
+    if (selectedStage === 'Packaging') {
+      // For Packaging stage, device must have completed FQC
+      const deviceStatus = getDeviceStatus(deviceId);
+      if (!deviceStatus || deviceStatus.fqcStatus !== 'completed') {
+        setError('Cannot proceed to Packaging. Device must complete FQC stage first.');
+        return;
+      }
+    }
+    
     setError('');
     const baseCheckpoints = selectedStage === 'FQC' ? FQC_CHECKPOINTS : PACKAGING_CHECKPOINTS;
     setCheckpoints(baseCheckpoints.map(cp => ({ ...cp, status: null, image: null, reason: '' })));
@@ -182,12 +289,60 @@ const App: React.FC = () => {
     if (!isComplete) { alert('Please complete all checkpoints, images, and reasons.'); return; }
     setIsSubmitting(true);
     const report: QCReport = { id: `REP-${Date.now()}`, timestamp: new Date().toISOString(), stage: selectedStage, userId: currentUser?.userId || 'Unknown', deviceId, checkpoints };
-    setTimeout(() => { saveReport(report); setIsSubmitting(false); setCurrentStep(AppStep.SUCCESS); }, 1500);
+    setTimeout(() => { 
+      saveReport(report);
+      // Update device status after successful submission
+      updateDeviceStatus(deviceId, selectedStage as 'FQC' | 'Packaging', report.checkpoints.some(cp => cp.status === 'Fail') ? 'failed' : 'completed');
+      setIsSubmitting(false); 
+      setCurrentStep(AppStep.SUCCESS); 
+    }, 1500);
   };
 
   const resetApp = () => { setDeviceId(''); setDeviceImage(null); setCheckpoints([]); setCurrentStep(AppStep.DEVICE_ID_ENTRY); };
   const logout = () => { setCurrentUser(null); setSelectedStage(null); setDeviceId(''); setDeviceImage(null); setCheckpoints([]); setError(''); setCurrentStep(AppStep.STAGE_SELECTION); };
+  
+  const handleExportCSV = () => {
+    const reports = getStoredReports();
+    if (reports.length === 0) {
+      alert('No reports available to export.');
+      return;
+    }
 
+    // Helper to escape CSV values safely
+    const escape = (val) => `"${String(val || '').replace(/"/g, '""')}"`;
+
+    const headers = ['Report ID', 'Timestamp', 'Stage', 'User ID', 'Device ID', 'Checkpoints Summary'];
+    const rows = reports.map(r => {
+      // Create a detailed summary of checkpoints for a single column
+      const checkpointsSummary = r.checkpoints.map(cp => 
+        `${cp.label}: ${cp.status || 'N/A'}${cp.status === 'Fail' ? ' (Reason: ' + (cp.reason || 'Not provided') + ')' : ''}`
+      ).join(' | ');
+
+      return [
+        escape(r.id),
+        escape(r.timestamp),
+        escape(r.stage),
+        escape(r.userId),
+        escape(r.deviceId),
+        escape(checkpointsSummary)
+      ].join(',');
+    });
+
+    const csvContent = [headers.join(','), ...rows].join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    
+    // Set timestamped filename
+    const dateStr = new Date().toISOString().split('T')[0];
+    link.setAttribute('href', url);
+    link.setAttribute('download', `Flex_QC_Export_${dateStr}.csv`);
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+  
   const renderHeader = () => (
     <header className="factory-gradient text-white p-4 shadow-lg flex justify-between items-center">
       <div className="flex items-center gap-2 cursor-pointer" onClick={() => !currentUser && setCurrentStep(AppStep.STAGE_SELECTION)}>
@@ -208,6 +363,220 @@ const App: React.FC = () => {
     </header>
   );
 
+  const renderDashboard = () => {
+    const reports = getStoredReports();
+    const deviceStatuses = getDeviceStatuses();
+    
+    // Calculate dashboard metrics
+    const dailyCount = reports.filter(r => {
+      const reportDate = new Date(r.timestamp);
+      const today = new Date();
+      return reportDate.getDate() === today.getDate() && 
+             reportDate.getMonth() === today.getMonth() &&
+             reportDate.getFullYear() === today.getFullYear();
+    }).length;
+    
+    const fqcCount = reports.filter(r => r.stage === 'FQC').length;
+    const packagingCount = reports.filter(r => r.stage === 'Packaging').length;
+    
+    const passCount = reports.reduce((count, report) => {
+      return count + report.checkpoints.filter(cp => cp.status === 'Pass').length;
+    }, 0);
+    
+    const failCount = reports.reduce((count, report) => {
+      return count + report.checkpoints.filter(cp => cp.status === 'Fail').length;
+    }, 0);
+    
+    // Get top failure checkpoints
+    const failureCounts: Record<string, number> = {};
+    reports.forEach(report => {
+      report.checkpoints.forEach(cp => {
+        if (cp.status === 'Fail') {
+          failureCounts[cp.label] = (failureCounts[cp.label] || 0) + 1;
+        }
+      });
+    });
+    
+    const sortedFailures = Object.entries(failureCounts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5); // Top 5 failures
+    
+    // Inspector productivity
+    const inspectorProductivity: Record<string, number> = {};
+    reports.forEach(report => {
+      inspectorProductivity[report.userId] = (inspectorProductivity[report.userId] || 0) + 1;
+    });
+    
+    return (
+      <div className="space-y-6 animate-in fade-in duration-500">
+        <div className="flex flex-col gap-4">
+          <button onClick={() => setCurrentStep(AppStep.STAGE_SELECTION)} className="self-start flex items-center text-blue-600 font-bold text-sm gap-1 hover:text-blue-800 transition-colors"><ArrowLeftIcon className="w-4 h-4" /> BACK</button>
+          
+          <div className="flex justify-between items-center bg-white p-5 rounded-2xl shadow-sm border border-gray-100">
+            <div className="flex items-center gap-3">
+              <div className="bg-slate-900 p-2 rounded-lg">
+                <svg width="24" height="24" viewBox="0 0 100 100" fill="none"><rect width="100" height="100" rx="10" fill="#1e293b"/><path d="M25 25H75V40H40V50H70V65H40V75H25V25Z" fill="white"/></svg>
+              </div>
+              <div>
+                <h2 className="text-xl font-black text-slate-800 uppercase tracking-tight leading-tight">Admin Dashboard</h2>
+                <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Analytics & Monitoring</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-3">
+              <button 
+                onClick={handleExportCSV}
+                className="bg-blue-600 text-white hover:bg-blue-700 px-4 py-2 rounded-xl transition-all shadow-md flex items-center gap-2 group border border-blue-500"
+                title="Download QC reports as CSV"
+              >
+                <SaveIcon className="w-4 h-4 group-hover:translate-y-0.5 transition-transform" />
+                <span className="text-[10px] font-black uppercase">Export Reports</span>
+              </button>
+              <button onClick={logout} className="text-red-500 font-black text-xs uppercase border border-red-100 px-3 py-1.5 rounded-lg hover:bg-red-50 transition-colors">Logout</button>
+            </div>
+          </div>
+        </div>
+        
+        {/* Dashboard Metrics */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+          <div className="bg-white p-4 rounded-xl shadow border border-gray-100">
+            <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Daily Inspections</p>
+            <p className="text-2xl font-black text-blue-600">{dailyCount}</p>
+          </div>
+          <div className="bg-white p-4 rounded-xl shadow border border-gray-100">
+            <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest">FQC Progress</p>
+            <p className="text-2xl font-black text-green-600">{fqcCount}</p>
+          </div>
+          <div className="bg-white p-4 rounded-xl shadow border border-gray-100">
+            <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Packaging Progress</p>
+            <p className="text-2xl font-black text-purple-600">{packagingCount}</p>
+          </div>
+          <div className="bg-white p-4 rounded-xl shadow border border-gray-100">
+            <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Overall Status</p>
+            <p className="text-2xl font-black text-slate-800">{passCount}/{(passCount + failCount)}</p>
+          </div>
+        </div>
+        
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          {/* Pass/Fail Summary */}
+          <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden shadow-sm">
+            <div className="px-4 py-3 bg-gray-50 border-b border-gray-100">
+              <h3 className="text-[10px] font-black text-gray-500 uppercase tracking-widest">Pass/Fail Summary</h3>
+            </div>
+            <div className="p-4">
+              <div className="space-y-3">
+                <div>
+                  <div className="flex justify-between mb-1">
+                    <span className="text-sm font-bold text-green-600">Pass</span>
+                    <span className="text-sm font-bold">{passCount}</span>
+                  </div>
+                  <div className="w-full bg-gray-200 rounded-full h-2">
+                    <div 
+                      className="bg-green-600 h-2 rounded-full" 
+                      style={{ width: `${((passCount) / (passCount + failCount || 1)) * 100}%` }}
+                    ></div>
+                  </div>
+                </div>
+                <div>
+                  <div className="flex justify-between mb-1">
+                    <span className="text-sm font-bold text-red-600">Fail</span>
+                    <span className="text-sm font-bold">{failCount}</span>
+                  </div>
+                  <div className="w-full bg-gray-200 rounded-full h-2">
+                    <div 
+                      className="bg-red-600 h-2 rounded-full" 
+                      style={{ width: `${((failCount) / (passCount + failCount || 1)) * 100}%` }}
+                    ></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          
+          {/* Top Failure Checkpoints */}
+          <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden shadow-sm">
+            <div className="px-4 py-3 bg-gray-50 border-b border-gray-100">
+              <h3 className="text-[10px] font-black text-gray-500 uppercase tracking-widest">Top Failure Checkpoints</h3>
+            </div>
+            <div className="p-4">
+              {sortedFailures.length > 0 ? (
+                <ul className="space-y-2">
+                  {sortedFailures.map(([checkpoint, count], index) => (
+                    <li key={index} className="flex justify-between items-center">
+                      <span className="text-sm font-bold text-gray-700 truncate max-w-[70%]">{checkpoint}</span>
+                      <span className="text-sm font-black text-red-600">{count}</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-gray-500 text-sm font-bold text-center py-4">No failures recorded</p>
+              )}
+            </div>
+          </div>
+        </div>
+        
+        {/* Inspector Productivity */}
+        <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden shadow-sm">
+          <div className="px-4 py-3 bg-gray-50 border-b border-gray-100">
+            <h3 className="text-[10px] font-black text-gray-500 uppercase tracking-widest">Inspector Productivity</h3>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="bg-slate-50 border-b border-gray-200 text-slate-500 font-black uppercase tracking-widest">
+                <tr><th className="px-4 py-3">Inspector ID</th><th className="px-4 py-3">Inspection Count</th></tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100 font-bold">
+                {Object.entries(inspectorProductivity).map(([userId, count], index) => (
+                  <tr key={index}>
+                    <td className="px-4 py-4 text-gray-900 font-bold">{userId}</td>
+                    <td className="px-4 py-4 text-blue-600 font-black">{count}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        
+        {/* Device Traceability */}
+        <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden shadow-sm">
+          <div className="px-4 py-3 bg-gray-50 border-b border-gray-100 flex justify-between items-center">
+            <h3 className="text-[10px] font-black text-gray-500 uppercase tracking-widest">Serial Number Traceability</h3>
+            <button onClick={() => setCurrentStep(AppStep.ADMIN)} className="text-[9px] text-blue-600 font-black uppercase hover:underline transition-all">Manage Users</button>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="bg-slate-50 border-b border-gray-200 text-slate-500 font-black uppercase tracking-widest">
+                <tr>
+                  <th className="px-4 py-3">Device ID</th>
+                  <th className="px-4 py-3">FQC Status</th>
+                  <th className="px-4 py-3">Packaging Status</th>
+                  <th className="px-4 py-3">Last Updated</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100 font-bold">
+                {deviceStatuses.slice(0, 10).map((status, index) => (
+                  <tr key={index}>
+                    <td className="px-4 py-4 text-gray-900 font-bold">{status.deviceId}</td>
+                    <td className="px-4 py-4">
+                      <span className={`text-[10px] uppercase ${status.fqcStatus === 'completed' ? 'text-green-600' : status.fqcStatus === 'pending' ? 'text-yellow-600' : 'text-red-600'}`}>
+                        {status.fqcStatus}
+                      </span>
+                    </td>
+                    <td className="px-4 py-4">
+                      <span className={`text-[10px] uppercase ${status.packagingStatus === 'completed' ? 'text-green-600' : status.packagingStatus === 'pending' ? 'text-yellow-600' : 'text-red-600'}`}>
+                        {status.packagingStatus}
+                      </span>
+                    </td>
+                    <td className="px-4 py-4 text-gray-500 text-[10px]">{new Date(status.lastUpdated).toLocaleDateString()}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    );
+  };
+  
   return (
     <div className="min-h-screen flex flex-col bg-gray-50">
       {renderHeader()}
@@ -276,13 +645,22 @@ const App: React.FC = () => {
 
             <div>
               <label className="block text-[10px] font-black text-gray-400 uppercase tracking-widest mb-1 ml-1">Serial Number</label>
-              <input 
-                id="serialNumberInput"
-                value={deviceId} 
-                onChange={(e) => setDeviceId(e.target.value.toUpperCase())} 
-                placeholder="FLEX-XXXX" 
-                className="w-full px-4 py-4 bg-white border border-gray-200 rounded-xl text-center text-xl font-mono font-black tracking-widest text-black" 
-              />
+              <div className="flex gap-2">
+                <input 
+                  id="serialNumberInput"
+                  value={deviceId} 
+                  onChange={(e) => setDeviceId(e.target.value.toUpperCase())} 
+                  placeholder="FLEX-XXXX" 
+                  className="flex-1 px-4 py-4 bg-white border border-gray-200 rounded-xl text-center text-xl font-mono font-black tracking-widest text-black" 
+                />
+                <button 
+                  type="button" 
+                  onClick={() => setCurrentStep(AppStep.SCAN_DEVICE_ID)}
+                  className="bg-blue-600 text-white font-black py-4 rounded-xl shadow-lg uppercase tracking-widest active:scale-[0.98] transition-transform flex items-center justify-center"
+                >
+                  <CameraIcon className="w-5 h-5" />
+                </button>
+              </div>
             </div>
             <button onClick={handleDeviceSubmit} className="w-full bg-blue-600 text-white font-black py-4 rounded-xl shadow-lg uppercase tracking-widest active:scale-[0.98] transition-transform">Continue <ChevronRightIcon className="inline ml-1" /></button>
           </div>
@@ -342,6 +720,40 @@ const App: React.FC = () => {
           </div>
         )}
 
+        {currentStep === AppStep.SCAN_DEVICE_ID && (
+          <div className="flex-1 flex flex-col justify-center space-y-6 animate-in slide-in-from-right duration-300">
+            <button onClick={() => setCurrentStep(AppStep.DEVICE_ID_ENTRY)} className="self-start flex items-center text-blue-600 font-bold text-sm gap-1 hover:text-blue-800 transition-colors"><ArrowLeftIcon className="w-4 h-4" /> BACK</button>
+            <h2 className="text-2xl font-black uppercase text-center">Scan Device ID</h2>
+            
+            <div className="space-y-4">
+              <div className="w-full h-96 rounded-2xl overflow-hidden border-2 border-dashed border-gray-300 bg-gray-100 flex items-center justify-center relative">
+                <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
+                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                  <div className="border-4 border-blue-500 rounded-xl w-64 h-64"></div>
+                </div>
+                <div className="absolute bottom-4 left-0 right-0 text-center text-white font-bold bg-black/50 p-2 rounded-lg">
+                  Point camera at QR/Barcode
+                </div>
+              </div>
+              
+              <div className="flex gap-3">
+                <button 
+                  onClick={startScanning}
+                  className="flex-1 bg-blue-600 text-white font-black py-3 rounded-xl shadow-lg uppercase text-sm active:scale-[0.98] transition-transform"
+                >
+                  Start Scanning
+                </button>
+                <button 
+                  onClick={stopScanning}
+                  className="flex-1 bg-red-600 text-white font-black py-3 rounded-xl shadow-lg uppercase text-sm active:scale-[0.98] transition-transform"
+                >
+                  Stop
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {currentStep === AppStep.SUCCESS && (
           <div className="flex-1 flex flex-col items-center justify-center text-center space-y-6 animate-in zoom-in duration-500">
             <div className="w-24 h-24 bg-green-100 text-green-600 rounded-full flex items-center justify-center shadow-inner"><CheckIcon className="w-12 h-12" /></div>
@@ -350,13 +762,31 @@ const App: React.FC = () => {
           </div>
         )}
 
-        {currentStep === AppStep.ADMIN && <AdminPanel onBack={() => setCurrentStep(AppStep.STAGE_SELECTION)} onLogout={logout} />}
+        {currentStep === AppStep.ADMIN && (
+          <div className="space-y-6 animate-in fade-in duration-500">
+            <div className="flex justify-between items-center bg-white p-4 rounded-2xl shadow-sm border border-gray-100 mb-4">
+              <h2 className="text-xl font-black text-slate-800 uppercase tracking-tight">Admin Console</h2>
+              <div className="flex gap-2">
+                <button 
+                  onClick={() => setCurrentStep(AppStep.DASHBOARD)}
+                  className="bg-blue-600 text-white px-4 py-2 rounded-lg transition-all font-black text-[10px] uppercase hover:bg-blue-700"
+                >
+                  Dashboard
+                </button>
+                <button onClick={logout} className="text-red-500 font-black text-xs uppercase border border-red-100 px-3 py-1.5 rounded-lg hover:bg-red-50 transition-colors">Logout</button>
+              </div>
+            </div>
+            <AdminPanel onBack={() => setCurrentStep(AppStep.STAGE_SELECTION)} onLogout={logout} onDashboard={() => setCurrentStep(AppStep.DASHBOARD)} />
+          </div>
+        )}
+        
+        {currentStep === AppStep.DASHBOARD && renderDashboard()}
       </main>
     </div>
   );
 };
 
-const AdminPanel: React.FC<{ onBack: () => void, onLogout: () => void }> = ({ onBack, onLogout }) => {
+const AdminPanel: React.FC<{ onBack: () => void, onLogout: () => void, onDashboard?: () => void }> = ({ onBack, onLogout, onDashboard }) => {
   const [users, setUsers] = useState<User[]>([]);
   const [newUserId, setNewUserId] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -507,6 +937,16 @@ const AdminPanel: React.FC<{ onBack: () => void, onLogout: () => void }> = ({ on
             </div>
           </div>
           <div className="flex items-center gap-3">
+            <button 
+              onClick={() => onDashboard && onDashboard()}
+              className="bg-purple-600 text-white hover:bg-purple-700 px-4 py-2 rounded-xl transition-all shadow-md flex items-center gap-2 group border border-purple-500"
+              title="View Dashboard"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4 group-hover:translate-y-0.5 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+              </svg>
+              <span className="text-[10px] font-black uppercase">Dashboard</span>
+            </button>
             {/* Export Reports Button */}
             <button 
               onClick={handleExportCSV}

@@ -26,11 +26,20 @@ export interface QCReport {
   checkpoints: CheckpointResult[];
 }
 
+export interface DeviceStatus {
+  deviceId: string;
+  fqcStatus: 'pending' | 'completed' | 'failed';
+  packagingStatus: 'pending' | 'completed' | 'failed';
+  lastUpdated: string;
+}
+
 export enum AppStep {
   STAGE_SELECTION,
   LOGIN,
   DEVICE_ID_ENTRY,
+  SCAN_DEVICE_ID,
   CHECKLIST,
   SUCCESS,
-  ADMIN
+  ADMIN,
+  DASHBOARD
 }
